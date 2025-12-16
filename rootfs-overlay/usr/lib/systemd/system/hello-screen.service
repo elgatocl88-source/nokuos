@@ -1,0 +1,13 @@
+[Unit]
+Description=Lanza la pantalla de bienvenida estilo macOS en el primer arranque.
+After=graphical.target
+
+[Service]
+Type=oneshot
+# Ejecuta tu script de bienvenida
+ExecStart=/usr/local/bin/hello-screen.sh
+# Desactiva este servicio después de una ejecución exitosa
+ExecStopPost=/usr/bin/systemctl disable hello-screen.service
+
+[Install]
+WantedBy=multi-user.target

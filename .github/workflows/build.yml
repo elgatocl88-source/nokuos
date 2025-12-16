@@ -1,0 +1,203 @@
+name: build-ublue
+
+on:
+  pull_request:
+  merge_group:
+  schedule:
+    - cron: "0 15 * * *" # 3pm UTC everyday (timed against official fedora container pushes)
+  workflow_dispatch:
+
+env:
+  IMAGE_REGISTRY: ghcr.io/${{ github.repository_owner }}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}-${{ inputs.fedora_version }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - amd64
+        version:
+          - 41
+        flavor:
+          - base
+          - base-nvidia
+          - silverblue
+          - silverblue-nvidia
+          - kinoite
+          - kinoite-nvidia
+
+    steps:
+      # Checkout push-to-registry action GitHub repository
+      - name: Maximize build space
+        uses: ublue-os/remove-unwanted-software@v9
+        with:
+          remove-android: 'true'
+
+      - name: Checkout Push to Registry action
+        uses: actions/checkout@v4
+
+      - name: Generate tags
+        id: generate-tags
+        shell: bash
+        run: |
+          # Generate a timestamp for creating an image version history
+          TIMESTAMP="$(date +%Y%m%d)"
+          MAJOR_VERSION="$(echo ${{ matrix.version }} | cut -d . -f 1)"
+          COMMIT_TAGS=()
+          BUILD_TAGS=()
+          # Have tags for tracking builds during pull request
+          SHA_SHORT="${GITHUB_SHA::7}"
+
+          # Using clever bash string templating, https://stackoverflow.com/q/40771781
+          # don't make malformed tags if $MAJOR_VERSION is empty (base-image didn't include proper labels) --
+          COMMIT_TAGS+=("${SHA_SHORT}${MAJOR_VERSION:+-$MAJOR_VERSION}")
+          BUILD_TAGS=("${MAJOR_VERSION}" "${MAJOR_VERSION}-${{ matrix.arch }}" "${MAJOR_VERSION:+$MAJOR_VERSION-}${TIMESTAMP}" "${MAJOR_VERSION:+$MAJOR_VERSION-}${TIMESTAMP}-${{ matrix.arch }}")
+          # --
+          if [ "${MAJOR_VERSION}" == "40" ]; then
+            BUILD_TAGS+=("${TIMESTAMP}")
+            BUILD_TAGS+=("latest-${{ matrix.arch }}")
+          fi
+
+          alias_tags=("${BUILD_TAGS[@]}")
+          echo "Generated the following build tags: "
+          for TAG in "${BUILD_TAGS[@]}"; do
+              echo "${TAG}"
+          done
+          echo "alias_tags=${alias_tags[*]}" >> $GITHUB_OUTPUT
+
+          IMAGE_NAME="cosmic-${{ matrix.flavor }}"
+          if [[ "$IMAGE_NAME" == *-base* ]]; then
+            IMAGE_NAME="${IMAGE_NAME//-base/}"
+          fi
+          echo "IMAGE_NAME=${IMAGE_NAME}" >> $GITHUB_ENV
+
+      # Build metadata
+      - name: Image Metadata
+        uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: |
+            ${{ env.IMAGE_NAME }}
+          labels: |
+            org.opencontainers.image.title=${{ env.IMAGE_NAME }}
+            org.opencontainers.image.version=${{ matrix.version }}
+            org.opencontainers.image.description=${{ env.description }}
+            io.artifacthub.package.readme-url=https://raw.githubusercontent.com/ublue-os/cosmic/main/README.md
+            io.artifacthub.package.logo-url=https://avatars.githubusercontent.com/u/120078124?s=200&v=4
+
+
+      # Create Variables. Use UBlue images for amd64, fedora-ostree desktop for arm64
+      - name: matrix-variables
+        run: |
+          if [[ ${{ matrix.arch }} = "amd64" && ${{ matrix.version }} != "rawhide" ]]; then
+            echo "SOURCE_ORG=ghcr.io/ublue-os" >> $GITHUB_ENV
+            if [[ "${{ matrix.flavor }}" =~ "nvidia" ]]; then
+              echo "SOURCE_IMAGE=${{ matrix.flavor }}" >> $GITHUB_ENV
+            else
+              echo "SOURCE_IMAGE=${{ matrix.flavor }}-main" >> $GITHUB_ENV
+            fi
+          else
+            echo "SOURCE_ORG=quay.io/fedora-ostree-desktops" >> $GITHUB_ENV
+            echo "SOURCE_IMAGE=${{ matrix.flavor }}" >> $GITHUB_ENV
+          fi
+
+      - name: Build Image
+        id: build_image
+        run: |
+          sudo buildah build \
+            --arch "${{ matrix.arch }}" \
+            --format "docker" \
+            --build-arg FEDORA_MAJOR_VERSION="${{ matrix.version }}" \
+            --build-arg SOURCE_IMAGE="${{ env.SOURCE_IMAGE }}" \
+            --build-arg SOURCE_ORG="${{ env.SOURCE_ORG }}" \
+            --tag raw-img .
+
+      # Reprocess raw-img using rechunker which will delete it
+      - name: Run Rechunker
+        id: rechunk
+        uses: hhd-dev/rechunk@v1.1.3
+        with:
+          rechunk: 'ghcr.io/hhd-dev/rechunk:v0.8.1'
+          ref: 'raw-img'
+          prev-ref: "${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.version }}"
+          skip_compression: true
+          version: ${{ matrix.version }}
+          labels: |
+            org.opencontainers.image.title=${{ env.IMAGE_NAME }}
+            org.opencontainers.image.description=${{ env.description }}
+            io.artifacthub.package.readme-url=https://raw.githubusercontent.com/ublue-os/cosmic/main/README.md
+            io.artifacthub.package.logo-url=https://avatars.githubusercontent.com/u/120078124?s=200&v=4
+
+      - name: Load in podman and tag
+        run: |
+          IMAGE=$(podman pull ${{ steps.rechunk.outputs.ref }})
+          sudo rm -rf ${{ steps.rechunk.outputs.output }}
+          for tag in ${{ steps.generate-tags.outputs.alias_tags }}; do
+            podman tag $IMAGE ${{ env.IMAGE_NAME }}:$tag
+          done
+
+      # Workaround bug where capital letters in your GitHub username make it impossible to push to GHCR.
+      # https://github.com/macbre/push-to-ghcr/issues/12
+      - name: Lowercase Registry
+        id: registry_case
+        uses: ASzc/change-string-case-action@v6
+        with:
+          string: ${{ env.IMAGE_REGISTRY }}
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Push the image to GHCR (Image Registry)
+      - name: Push To GHCR
+        uses: redhat-actions/push-to-registry@v2
+        if: github.event_name != 'pull_request'
+        id: push
+        with:
+          registry: ${{ steps.registry_case.outputs.lowercase }}
+          image: ${{ env.IMAGE_NAME }}
+          tags: ${{ steps.generate-tags.outputs.alias_tags }}
+          extra-args: |
+            --disable-content-trust
+
+      # Sign container
+      - uses: sigstore/cosign-installer@v3.8.1
+        if: github.event_name != 'pull_request'
+
+      - name: Sign container image
+        if: github.event_name != 'pull_request'
+        run: |
+          cosign sign -y --key env://COSIGN_PRIVATE_KEY ${{ steps.registry_case.outputs.lowercase }}/${{ env.IMAGE_NAME }}@${TAGS}
+        env:
+          TAGS: ${{ steps.push.outputs.digest }}
+          COSIGN_EXPERIMENTAL: false
+          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+
+  check:
+    name: Check all builds successful
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - name: Exit on failure
+        if: ${{ needs.build.result == 'failure' }}
+        shell: bash
+        run: exit 1
+      - name: Exit
+        shell: bash
+        run: exit 0
